@@ -28,11 +28,13 @@ async def fetch_api(session, params):
     """Fetch alerts from the Pikud HaOref API."""
     async with session.get(API_URL, params=params) as resp:
         if resp.status != 200:
+            print(f"  API returned status {resp.status} for {params}")
             return []
         text = await resp.text()
         try:
             return json.loads(text)
         except json.JSONDecodeError:
+            print(f"  Failed to parse JSON for {params}: {text[:200]}")
             return []
 
 
