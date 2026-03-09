@@ -1,0 +1,12 @@
+services:
+  alerts-pipeline:
+    build: .
+    container_name: alerts-pipeline
+    restart: unless-stopped
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=us-east-2
+      - S3_BUCKET=alerts-dashboard-data
+      - CF_DISTRIBUTION=E28MP73WOLCLYQ
+      - INTERVAL_SECONDS=3600
