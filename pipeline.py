@@ -24,9 +24,16 @@ cf = boto3.client("cloudfront", region_name=os.environ.get("AWS_REGION", "us-eas
 # ── Fetch ──────────────────────────────────────────────────────
 
 
+API_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Referer": "https://www.oref.org.il/",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+
 async def fetch_api(session, params):
     """Fetch alerts from the Pikud HaOref API."""
-    async with session.get(API_URL, params=params) as resp:
+    async with session.get(API_URL, params=params, headers=API_HEADERS) as resp:
         if resp.status != 200:
             print(f"  API returned status {resp.status} for {params}")
             return []
