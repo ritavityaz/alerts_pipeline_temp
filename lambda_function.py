@@ -1,49 +1,36 @@
 import json
-import os
+import io
 import csv
 import asyncio
-import time
-import signal
 import aiohttp
 from datetime import datetime, timedelta, timezone
+from collections import defaultdict
 
 import polars as pl
 import boto3
 
-BUCKET = os.environ.get("S3_BUCKET", "alerts-dashboard-data")
-CF_DISTRIBUTION = os.environ.get("CF_DISTRIBUTION", "E28MP73WOLCLYQ")
+BUCKET = "alerts-dashboard-data"
+CF_DISTRIBUTION = "E28MP73WOLCLYQ"
 API_URL = "https://alerts-history.oref.org.il/Shared/Ajax/GetAlarmsHistory.aspx"
 CUTOFF = datetime(2026, 2, 26)  # Israel local time (naive, matches API data)
 CONCURRENCY = 10
-INTERVAL = int(os.environ.get("INTERVAL_SECONDS", "3600"))  # default 1 hour
 
-s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-2"))
-cf = boto3.client("cloudfront", region_name=os.environ.get("AWS_REGION", "us-east-2"))
+s3 = boto3.client("s3")
+cf = boto3.client("cloudfront")
 
 
 # ── Fetch ──────────────────────────────────────────────────────
 
 
-API_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Referer": "https://www.oref.org.il/",
-    "X-Requested-With": "XMLHttpRequest",
-}
-
-
 async def fetch_api(session, params):
     """Fetch alerts from the Pikud HaOref API."""
-    async with session.get(API_URL, params=params, headers=API_HEADERS) as resp:
+    async with session.get(API_URL, params=params) as resp:
         if resp.status != 200:
-            print(f"  API returned status {resp.status} for {params}")
             return []
-        text = (await resp.text()).strip()
-        if not text:
-            return []
+        text = await resp.text()
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            print(f"  Failed to parse JSON for {params}: {text[:200]}")
             return []
 
 
@@ -65,7 +52,7 @@ async def fetch_all_cities(cities):
             data = await fetch_api(session, {
                 "lang": "he",
                 "mode": "3",
-                "city_0": city,
+                f"city_0": city,
             })
             for a in data:
                 rid = a.get("rid")
@@ -85,8 +72,7 @@ async def fetch_all_cities(cities):
 def load_cities():
     """Load city list from bundled cities.csv."""
     cities = []
-    csv_path = os.path.join(os.path.dirname(__file__), "cities.csv")
-    with open(csv_path, "r", encoding="utf-8") as f:
+    with open("cities.csv", "r", encoding="utf-8") as f:
         reader = csv.reader(f)
         next(reader)  # skip header
         for row in reader:
@@ -123,6 +109,7 @@ def s3_write_json(key, data):
 
 def transform(raw_alerts):
     """
+    Replicates fetch_analysis.py:
     1. Type threats
     2. Classify events
     3. Match resolutions (2-pass asof join)
@@ -214,6 +201,7 @@ def transform(raw_alerts):
 
 def generate_cube(df_typed):
     """Generate alerts_cube.json from typed alerts."""
+    # Filter to actual alerts after cutoff
     alerts = df_typed.filter(
         pl.col("event_type") == "alert",
         pl.col("alertDate").str.to_datetime() >= pl.lit(CUTOFF),
@@ -223,6 +211,7 @@ def generate_cube(df_typed):
 
     cat_map = {"1": 0, "2": 1, "10": 2}
 
+    # Group by (city, hour, category)
     grouped = (
         alerts
         .with_columns(pl.col("ts").dt.strftime("%Y-%m-%dT%H").alias("hour"))
@@ -264,12 +253,14 @@ def generate_timeline(alerts_matched):
             return None
         return round((dt - base).total_seconds() / 60)
 
+    # Filter to valid threats after cutoff
     filtered = alerts_matched.filter(
         pl.col("threat_type").is_in(list(valid_threats)),
     ).with_columns(
         pl.col("ts").alias("_ts"),
     )
 
+    # Compute start time (warning if earlier than alert, else alert)
     events = []
     for row in filtered.iter_rows(named=True):
         ts = row["_ts"]
@@ -306,31 +297,24 @@ def generate_timeline(alerts_matched):
     return result
 
 
-# ── Main ───────────────────────────────────────────────────────
+# ── Main handler ───────────────────────────────────────────────
 
 
-def run_pipeline():
-    print(f"[{datetime.now()}] Starting pipeline...")
+def lambda_handler(event, context):
+    print("Starting pipeline...")
 
-    # Check if raw data exists (initialization vs incremental)
+    # Step 1: Check if raw data exists (initialization vs incremental)
     raw_key = "raw/alerts_all.json"
-    local_raw = os.path.join(os.path.dirname(__file__), "alerts_all.json")
-    has_s3 = s3_exists(raw_key)
-    has_local = os.path.exists(local_raw)
+    is_init = not s3_exists(raw_key)
 
-    if not has_s3 and has_local:
-        print("Found local cache, uploading to S3...")
-        with open(local_raw, "r", encoding="utf-8") as f:
-            raw_alerts = json.load(f)
-        print(f"Loaded {len(raw_alerts)} alerts from local cache")
-    elif not has_s3:
+    if is_init:
         print("First run — fetching all cities...")
         cities = load_cities()
-        raw_alerts = asyncio.run(fetch_all_cities(cities))
+        raw_alerts = asyncio.get_event_loop().run_until_complete(fetch_all_cities(cities))
     else:
         # Incremental: fetch last 24h and merge
         existing = s3_read_json(raw_key)
-        new_alerts = asyncio.run(fetch_latest())
+        new_alerts = asyncio.get_event_loop().run_until_complete(fetch_latest())
 
         # Merge & deduplicate by rid
         by_rid = {a["rid"]: a for a in existing}
@@ -339,27 +323,23 @@ def run_pipeline():
         raw_alerts = list(by_rid.values())
         print(f"Merged: {len(existing)} existing + {len(new_alerts)} new = {len(raw_alerts)} total")
 
-    # Save raw data locally first, then to S3
-    local_raw = os.path.join(os.path.dirname(__file__), "alerts_all.json")
-    with open(local_raw, "w", encoding="utf-8") as f:
-        json.dump(raw_alerts, f, ensure_ascii=False)
-    print(f"Saved locally: {local_raw} ({os.path.getsize(local_raw) / 1024:.0f} KB)")
+    # Save raw data
     s3_write_json(raw_key, raw_alerts)
 
-    # Transform
+    # Step 2: Transform
     print("Transforming...")
     df_typed, alerts_matched = transform(raw_alerts)
 
-    # Generate optimized files
+    # Step 3: Generate optimized files
     print("Generating optimized files...")
     cube = generate_cube(df_typed)
     timeline = generate_timeline(alerts_matched)
 
-    # Upload
+    # Step 4: Upload
     s3_write_json("optimized/alerts_cube.json", cube)
     s3_write_json("optimized/timeline_events.json", timeline)
 
-    # Invalidate CloudFront cache
+    # Step 5: Invalidate CloudFront cache
     cf.create_invalidation(
         DistributionId=CF_DISTRIBUTION,
         InvalidationBatch={
@@ -374,40 +354,11 @@ def run_pipeline():
         },
     )
     print("CloudFront invalidation created")
-    print(f"[{datetime.now()}] Pipeline complete! Processed {len(raw_alerts)} alerts")
+
+    print("Pipeline complete!")
+    return {"statusCode": 200, "body": f"Processed {len(raw_alerts)} alerts"}
 
 
-def main():
-    """Run pipeline on a loop with graceful shutdown."""
-    stop = False
-
-    def handle_signal(signum, frame):
-        nonlocal stop
-        print(f"\nReceived signal {signum}, shutting down...")
-        stop = True
-
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
-
-    # Run immediately on startup
-    while not stop:
-        try:
-            run_pipeline()
-        except Exception as e:
-            print(f"[{datetime.now()}] Pipeline error: {e}")
-
-        if stop:
-            break
-
-        print(f"Sleeping {INTERVAL}s until next run...")
-        # Sleep in small increments to allow graceful shutdown
-        for _ in range(INTERVAL):
-            if stop:
-                break
-            time.sleep(1)
-
-    print("Shutdown complete.")
-
-
+# Allow local testing
 if __name__ == "__main__":
-    main()
+    lambda_handler({}, None)
