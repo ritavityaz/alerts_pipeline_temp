@@ -9,4 +9,4 @@ services:
       - AWS_REGION=us-east-2
       - S3_BUCKET=alerts-dashboard-data
       - CF_DISTRIBUTION=E28MP73WOLCLYQ
-      - INTERVAL_SECONDS=3600
+      - INTERVAL_SECONDS=600
