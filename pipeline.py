@@ -267,7 +267,8 @@ def generate_events_parquet(alerts_matched, zone_map, name_en_map):
     )
 
     # Compute start = min(warning_ts, ts), end = resolved_ts
-    # Store as UTC epoch ms — dashboard converts to Israel time for display
+    # Store as Israel wall-clock epoch ms (strip tz before epoch)
+    # so dashboard can use new Date(ms) directly without toLocaleString per row
     events = (
         filtered
         .with_columns(
@@ -277,8 +278,8 @@ def generate_events_parquet(alerts_matched, zone_map, name_en_map):
         )
         .filter(pl.col("start_ts") >= pl.lit(CUTOFF))
         .with_columns(
-            pl.col("start_ts").dt.epoch("ms").alias("start_ms"),
-            pl.col("resolved_ts").dt.epoch("ms").alias("end_ms"),
+            pl.col("start_ts").dt.replace_time_zone(None).dt.epoch("ms").alias("start_ms"),
+            pl.col("resolved_ts").dt.replace_time_zone(None).dt.epoch("ms").alias("end_ms"),
             pl.col("data").replace(zone_map, default="").alias("zone_en"),
             pl.col("data").replace(name_en_map, default="").alias("name_en"),
         )
