@@ -226,7 +226,7 @@ def generate_cube(df_typed):
 
     grouped = (
         alerts
-        .with_columns(pl.col("ts").dt.strftime("%Y-%m-%dT%H").alias("hour"))
+        .with_columns(pl.col("ts").dt.convert_time_zone("UTC").dt.strftime("%Y-%m-%dT%H").alias("hour"))
         .group_by("data", "hour", "category")
         .agg(pl.len().alias("count"))
         .sort("data", "hour", "category")
