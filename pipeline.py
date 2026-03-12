@@ -289,6 +289,55 @@ def generate_events_parquet(alerts_matched, zone_map, name_en_map):
     return events
 
 
+def generate_snapshot_json(alerts_pq):
+    """Generate snapshot.json — precomputed initial dashboard state for instant render."""
+    count_by_city = dict(zip(
+        alerts_pq.group_by("data").agg(pl.col("count").sum().alias("cnt"))["data"].to_list(),
+        alerts_pq.group_by("data").agg(pl.col("count").sum().alias("cnt"))["cnt"].to_list(),
+    ))
+
+    total_alerts = int(alerts_pq["count"].sum())
+    n_cities = alerts_pq["data"].n_unique()
+
+    daily = (
+        alerts_pq
+        .with_columns((pl.col("ts") // 86400000).alias("day_key"))
+        .group_by("day_key").agg(pl.col("count").sum().alias("cnt"))
+        .sort("cnt", descending=True)
+    )
+    peak_day_ms = int(daily[0, "day_key"] * 86400000)
+    peak_count = int(daily[0, "cnt"])
+
+    by_cat = dict(zip(
+        alerts_pq.group_by("category").agg(pl.col("count").sum().alias("cnt"))["category"].to_list(),
+        alerts_pq.group_by("category").agg(pl.col("count").sum().alias("cnt"))["cnt"].to_list(),
+    ))
+
+    hourly = (
+        alerts_pq.group_by("ts").agg(pl.col("count").sum().alias("cnt")).sort("ts")
+    )
+    sparkline = list(zip(
+        [int(x) for x in hourly["ts"].to_list()],
+        [int(x) for x in hourly["cnt"].to_list()],
+    ))
+
+    snapshot = {
+        "countByCity": count_by_city,
+        "totalAlerts": total_alerts,
+        "cities": n_cities,
+        "peakDayMs": peak_day_ms,
+        "peakCount": peak_count,
+        "missiles": int(by_cat.get("1", 0)),
+        "drones": int(by_cat.get("2", 0)),
+        "infiltration": int(by_cat.get("10", 0)),
+        "minTs": int(alerts_pq["ts"].min()),
+        "maxTs": int(alerts_pq["ts"].max()),
+        "sparkline": sparkline,
+    }
+    print(f"  Snapshot: {total_alerts} alerts, {n_cities} cities, {len(sparkline)} hourly points")
+    return snapshot
+
+
 # ── Main ───────────────────────────────────────────────────────
 
 
@@ -345,6 +394,8 @@ def run_pipeline():
     print(f"  Loaded geo mappings for {len(zone_map)} cities")
     alerts_pq = generate_alerts_parquet(df_typed, zone_map)
     events_pq = generate_events_parquet(alerts_matched, zone_map, name_en_map)
+    snapshot = generate_snapshot_json(alerts_pq)
+    s3_write_json("optimized/snapshot.json", snapshot)
 
     # Write parquet to temp files and upload
     with tempfile.TemporaryDirectory() as tmp:
@@ -368,10 +419,11 @@ def run_pipeline():
         DistributionId=CF_DISTRIBUTION,
         InvalidationBatch={
             "Paths": {
-                "Quantity": 2,
+                "Quantity": 3,
                 "Items": [
                     "/optimized/alerts.parquet",
                     "/optimized/events.parquet",
+                    "/optimized/snapshot.json",
                 ],
             },
             "CallerReference": str(datetime.now(timezone.utc).timestamp()),
