@@ -6,6 +6,7 @@ import time
 import signal
 import aiohttp
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import polars as pl
 import boto3
@@ -13,7 +14,7 @@ import boto3
 BUCKET = os.environ.get("S3_BUCKET", "alerts-dashboard-data")
 CF_DISTRIBUTION = os.environ.get("CF_DISTRIBUTION", "E28MP73WOLCLYQ")
 API_URL = "https://alerts-history.oref.org.il/Shared/Ajax/GetAlarmsHistory.aspx"
-CUTOFF = datetime(2026, 2, 26, tzinfo=timezone(timedelta(hours=2)))  # Israel Standard Time
+CUTOFF = datetime(2026, 2, 26, tzinfo=ZoneInfo("Asia/Jerusalem"))
 CONCURRENCY = 10
 INTERVAL = int(os.environ.get("INTERVAL_SECONDS", "3600"))  # default 1 hour
 
