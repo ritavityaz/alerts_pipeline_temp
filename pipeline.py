@@ -13,7 +13,7 @@ import boto3
 BUCKET = os.environ.get("S3_BUCKET", "alerts-dashboard-data")
 CF_DISTRIBUTION = os.environ.get("CF_DISTRIBUTION", "E28MP73WOLCLYQ")
 API_URL = "https://alerts-history.oref.org.il/Shared/Ajax/GetAlarmsHistory.aspx"
-CUTOFF = datetime(2026, 2, 26)  # Israel local time (naive, matches API data)
+CUTOFF = datetime(2026, 2, 26, tzinfo=timezone(timedelta(hours=2)))  # Israel Standard Time
 CONCURRENCY = 10
 INTERVAL = int(os.environ.get("INTERVAL_SECONDS", "3600"))  # default 1 hour
 
@@ -155,10 +155,12 @@ def transform(raw_alerts):
         .alias("event_type"),
     )
 
-    ts_col = pl.col("alertDate").str.to_datetime().alias("ts")
-    alerts = df_typed.filter(pl.col("event_type") == "alert").with_columns(ts_col).sort("data", "ts")
-    warnings = df_typed.filter(pl.col("event_type") == "early_warning").with_columns(ts_col).sort("data", "ts")
-    resolutions = df_typed.filter(pl.col("event_type") == "resolved").with_columns(ts_col).sort("data", "ts")
+    df_typed = df_typed.with_columns(
+        pl.col("alertDate").str.to_datetime("%Y-%m-%dT%H:%M:%S", time_zone="Asia/Jerusalem").alias("ts")
+    )
+    alerts = df_typed.filter(pl.col("event_type") == "alert").sort("data", "ts")
+    warnings = df_typed.filter(pl.col("event_type") == "early_warning").sort("data", "ts")
+    resolutions = df_typed.filter(pl.col("event_type") == "resolved").sort("data", "ts")
 
     print(f"  Alerts: {alerts.height}, Warnings: {warnings.height}, Resolutions: {resolutions.height}")
 
@@ -216,9 +218,7 @@ def generate_cube(df_typed):
     """Generate alerts_cube.json from typed alerts."""
     alerts = df_typed.filter(
         pl.col("event_type") == "alert",
-        pl.col("alertDate").str.to_datetime() >= pl.lit(CUTOFF),
-    ).with_columns(
-        pl.col("alertDate").str.to_datetime().alias("ts"),
+        pl.col("ts") >= pl.lit(CUTOFF),
     )
 
     cat_map = {"1": 0, "2": 1, "10": 2}
@@ -329,7 +329,13 @@ def run_pipeline():
         raw_alerts = asyncio.run(fetch_all_cities(cities))
     else:
         # Incremental: fetch last 24h and merge
-        existing = s3_read_json(raw_key)
+        # Use local file if fresh (< 6 hours old), otherwise fetch from S3
+        if has_local and (time.time() - os.path.getmtime(local_raw)) < 6 * 3600:
+            print("Using fresh local cache (< 6h old)")
+            with open(local_raw, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        else:
+            existing = s3_read_json(raw_key)
         new_alerts = asyncio.run(fetch_latest())
 
         # Merge & deduplicate by rid
