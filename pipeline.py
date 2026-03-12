@@ -4,6 +4,7 @@ import csv
 import asyncio
 import time
 import signal
+import tempfile
 import aiohttp
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -94,6 +95,19 @@ def load_cities():
             if row:
                 cities.append(row[0])
     return cities
+
+
+def load_geo_maps():
+    """Load city→zone_en and city→name_en mappings from zones.geojson on S3."""
+    resp = s3.get_object(Bucket=BUCKET, Key="optimized/zones.geojson")
+    gj = json.loads(resp["Body"].read())
+    zone_map = {}
+    name_en_map = {}
+    for feat in gj["features"]:
+        p = feat["properties"]
+        zone_map[p["name_he"]] = p.get("zone_en", "")
+        name_en_map[p["name_he"]] = p.get("name_en", "")
+    return zone_map, name_en_map
 
 
 # ── S3 helpers ─────────────────────────────────────────────────
@@ -215,96 +229,65 @@ def transform(raw_alerts):
 # ── Generate optimized files ───────────────────────────────────
 
 
-def generate_cube(df_typed):
-    """Generate alerts_cube.json from typed alerts."""
+def generate_alerts_parquet(df_typed, zone_map):
+    """Generate alerts.parquet — one row per city/hour/category with count."""
     alerts = df_typed.filter(
         pl.col("event_type") == "alert",
         pl.col("ts") >= pl.lit(CUTOFF),
     )
 
-    cat_map = {"1": 0, "2": 1, "10": 2}
-
     grouped = (
         alerts
-        .with_columns(pl.col("ts").dt.convert_time_zone("UTC").dt.strftime("%Y-%m-%dT%H").alias("hour"))
-        .group_by("data", "hour", "category")
-        .agg(pl.len().alias("count"))
-        .sort("data", "hour", "category")
+        .with_columns(
+            # Truncate to hour, store as Israel wall-clock epoch ms
+            # (strip timezone so epoch gives local time, matching dashboard's toIL)
+            pl.col("ts").dt.truncate("1h").dt.replace_time_zone(None).dt.epoch("ms").alias("ts"),
+            pl.col("category").cast(pl.Utf8).alias("category"),
+        )
+        .filter(pl.col("category").is_in(["1", "2", "10"]))
+        .group_by("data", "ts", "category")
+        .agg(pl.len().cast(pl.Int32).alias("count"))
+        .with_columns(
+            pl.col("data").replace(zone_map, default="").alias("zone_en"),
+        )
+        .sort("data", "ts", "category")
     )
 
-    cities = sorted(grouped["data"].unique().to_list())
-    city_idx = {c: i for i, c in enumerate(cities)}
-    hours = sorted(grouped["hour"].unique().to_list())
-    hour_idx = {h: i for i, h in enumerate(hours)}
-
-    c, h, t, n = [], [], [], []
-    for row in grouped.iter_rows(named=True):
-        cat_str = str(row["category"])
-        if cat_str not in cat_map:
-            continue
-        c.append(city_idx[row["data"]])
-        h.append(hour_idx[row["hour"]])
-        t.append(cat_map[cat_str])
-        n.append(row["count"])
-
-    cube = {"cities": cities, "hours": hours, "c": c, "h": h, "t": t, "n": n}
-    total = sum(n)
-    print(f"  Cube: {len(c)} tuples, {len(cities)} cities, {len(hours)} hours, {total} total alerts")
-    return cube
+    total = grouped["count"].sum()
+    cities = grouped["data"].n_unique()
+    print(f"  Alerts parquet: {grouped.height} rows, {cities} cities, {total} total alerts")
+    return grouped
 
 
-def generate_timeline(alerts_matched):
-    """Generate timeline_events.json from matched alerts."""
-    threat_map = {"missiles": 0, "drones": 1, "terrorists": 2}
+def generate_events_parquet(alerts_matched, zone_map, name_en_map):
+    """Generate events.parquet — one row per alert event with start/end ms."""
     valid_threats = {"missiles", "drones", "terrorists"}
-
-    base = CUTOFF
-
-    def to_minutes(dt):
-        if dt is None:
-            return None
-        return round((dt - base).total_seconds() / 60)
 
     filtered = alerts_matched.filter(
         pl.col("threat_type").is_in(list(valid_threats)),
-    ).with_columns(
-        pl.col("ts").alias("_ts"),
     )
 
-    events = []
-    for row in filtered.iter_rows(named=True):
-        ts = row["_ts"]
-        warning_ts = row.get("warning_ts")
-        resolved_ts = row.get("resolved_ts")
-        start = warning_ts if warning_ts and warning_ts < ts else ts
-        if start < CUTOFF:
-            continue
-        events.append({
-            "data": row["data"],
-            "threat_type": row["threat_type"],
-            "start": start,
-            "resolved": resolved_ts,
-            "warning": warning_ts,
-        })
+    # Compute start = min(warning_ts, ts), end = resolved_ts
+    # Strip timezone so epoch gives Israel wall-clock ms (matching dashboard's toIL)
+    events = (
+        filtered
+        .with_columns(
+            pl.when(
+                pl.col("warning_ts").is_not_null() & (pl.col("warning_ts") < pl.col("ts"))
+            ).then(pl.col("warning_ts")).otherwise(pl.col("ts")).alias("start_ts"),
+        )
+        .filter(pl.col("start_ts") >= pl.lit(CUTOFF))
+        .with_columns(
+            pl.col("start_ts").dt.replace_time_zone(None).dt.epoch("ms").alias("start_ms"),
+            pl.col("resolved_ts").dt.replace_time_zone(None).dt.epoch("ms").alias("end_ms"),
+            pl.col("data").replace(zone_map, default="").alias("zone_en"),
+            pl.col("data").replace(name_en_map, default="").alias("name_en"),
+        )
+        .select("data", "threat_type", "start_ms", "end_ms", "zone_en", "name_en")
+    )
 
-    cities = sorted(set(e["data"] for e in events))
-    city_idx = {c: i for i, c in enumerate(cities)}
-
-    c, t, s, r, w = [], [], [], [], []
-    for e in events:
-        c.append(city_idx[e["data"]])
-        t.append(threat_map[e["threat_type"]])
-        s.append(to_minutes(e["start"]))
-        r.append(to_minutes(e["resolved"]))
-        w.append(to_minutes(e["warning"]))
-
-    result = {
-        "cities": cities,
-        "base": base.isoformat(),
-        "c": c, "t": t, "s": s, "r": r, "w": w,
-    }
-    print(f"  Timeline: {len(c)} events, {len(cities)} cities")
-    return result
+    print(f"  Events parquet: {events.height} events, {events['data'].n_unique()} cities")
+    return events
 
 
 # ── Main ───────────────────────────────────────────────────────
@@ -357,14 +340,29 @@ def run_pipeline():
     print("Transforming...")
     df_typed, alerts_matched = transform(raw_alerts)
 
-    # Generate optimized files
+    # Generate optimized parquet files
     print("Generating optimized files...")
-    cube = generate_cube(df_typed)
-    timeline = generate_timeline(alerts_matched)
+    zone_map, name_en_map = load_geo_maps()
+    print(f"  Loaded geo mappings for {len(zone_map)} cities")
+    alerts_pq = generate_alerts_parquet(df_typed, zone_map)
+    events_pq = generate_events_parquet(alerts_matched, zone_map, name_en_map)
 
-    # Upload
-    s3_write_json("optimized/alerts_cube.json", cube)
-    s3_write_json("optimized/timeline_events.json", timeline)
+    # Write parquet to temp files and upload
+    with tempfile.TemporaryDirectory() as tmp:
+        alerts_path = os.path.join(tmp, "alerts.parquet")
+        events_path = os.path.join(tmp, "events.parquet")
+        alerts_pq.write_parquet(alerts_path, compression="zstd")
+        events_pq.write_parquet(events_path, compression="zstd")
+
+        for key, path in [("optimized/alerts.parquet", alerts_path),
+                          ("optimized/events.parquet", events_path)]:
+            size_kb = os.path.getsize(path) / 1024
+            s3.put_object(
+                Bucket=BUCKET, Key=key,
+                Body=open(path, "rb").read(),
+                ContentType="application/octet-stream",
+            )
+            print(f"Uploaded {key} ({size_kb:.0f} KB)")
 
     # Invalidate CloudFront cache
     cf.create_invalidation(
@@ -373,8 +371,8 @@ def run_pipeline():
             "Paths": {
                 "Quantity": 2,
                 "Items": [
-                    "/optimized/alerts_cube.json",
-                    "/optimized/timeline_events.json",
+                    "/optimized/alerts.parquet",
+                    "/optimized/events.parquet",
                 ],
             },
             "CallerReference": str(datetime.now(timezone.utc).timestamp()),
