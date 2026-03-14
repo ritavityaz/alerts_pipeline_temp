@@ -292,10 +292,8 @@ def generate_events_parquet(alerts_matched, zone_map, name_en_map):
 
 def generate_snapshot_json(alerts_pq):
     """Generate snapshot.json — precomputed initial dashboard state for instant render."""
-    count_by_city = dict(zip(
-        alerts_pq.group_by("data").agg(pl.col("count").sum().alias("cnt"))["data"].to_list(),
-        alerts_pq.group_by("data").agg(pl.col("count").sum().alias("cnt"))["cnt"].to_list(),
-    ))
+    city_agg = alerts_pq.group_by("data").agg(pl.col("count").sum().alias("cnt"))
+    count_by_city = dict(zip(city_agg["data"].to_list(), city_agg["cnt"].to_list()))
 
     total_alerts = int(alerts_pq["count"].sum())
     n_cities = alerts_pq["data"].n_unique()
@@ -309,10 +307,8 @@ def generate_snapshot_json(alerts_pq):
     peak_day_ms = int(daily[0, "day_key"] * 86400000)
     peak_count = int(daily[0, "cnt"])
 
-    by_cat = dict(zip(
-        alerts_pq.group_by("category").agg(pl.col("count").sum().alias("cnt"))["category"].to_list(),
-        alerts_pq.group_by("category").agg(pl.col("count").sum().alias("cnt"))["cnt"].to_list(),
-    ))
+    cat_agg = alerts_pq.group_by("category").agg(pl.col("count").sum().alias("cnt"))
+    by_cat = dict(zip(cat_agg["category"].to_list(), cat_agg["cnt"].to_list()))
 
     hourly = (
         alerts_pq.group_by("ts").agg(pl.col("count").sum().alias("cnt")).sort("ts")
