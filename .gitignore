@@ -3,3 +3,4 @@ __pycache__/
 package.zip
 build/
 alerts_all.json
+alerts_all.parquet

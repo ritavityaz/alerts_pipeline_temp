@@ -133,6 +133,30 @@ def s3_write_json(key, data):
     print(f"Uploaded {key} ({len(body) / 1024:.0f} KB)")
 
 
+def read_local_parquet(path):
+    """Read a local Parquet file into a list of dicts."""
+    return pl.read_parquet(path).to_dicts()
+
+
+def write_local_parquet(path, records):
+    """Write a list of dicts to a local Parquet file."""
+    pl.DataFrame(records).write_parquet(path, compression="zstd")
+
+
+def s3_read_parquet(key):
+    """Read a Parquet file from S3 into a list of dicts."""
+    resp = s3.get_object(Bucket=BUCKET, Key=key)
+    return pl.read_parquet(resp["Body"].read()).to_dicts()
+
+
+def s3_write_parquet(key, local_path):
+    """Upload a local Parquet file to S3 using multipart upload."""
+    s3.upload_file(local_path, BUCKET, key,
+                   ExtraArgs={"ContentType": "application/octet-stream"})
+    size_kb = os.path.getsize(local_path) / 1024
+    print(f"Uploaded {key} ({size_kb:.0f} KB)")
+
+
 # ── Transform ──────────────────────────────────────────────────
 
 
@@ -342,29 +366,39 @@ def run_pipeline():
     print(f"[{datetime.now()}] Starting pipeline...")
 
     # Check if raw data exists (initialization vs incremental)
-    raw_key = "raw/alerts_all.json"
-    local_raw = os.path.join(os.path.dirname(__file__), "alerts_all.json")
+    raw_key = "raw/alerts_all.parquet"
+    legacy_key = "raw/alerts_all.json"
+    local_raw = os.path.join(os.path.dirname(__file__), "alerts_all.parquet")
+    local_legacy = os.path.join(os.path.dirname(__file__), "alerts_all.json")
     has_s3 = s3_exists(raw_key)
+    has_s3_legacy = not has_s3 and s3_exists(legacy_key)
     has_local = os.path.exists(local_raw)
+    has_local_legacy = not has_local and os.path.exists(local_legacy)
 
-    if not has_s3 and has_local:
-        print("Found local cache, uploading to S3...")
-        with open(local_raw, "r", encoding="utf-8") as f:
-            raw_alerts = json.load(f)
+    if not has_s3 and not has_s3_legacy and has_local:
+        print("Found local parquet cache, uploading to S3...")
+        raw_alerts = read_local_parquet(local_raw)
         print(f"Loaded {len(raw_alerts)} alerts from local cache")
+    elif not has_s3 and not has_s3_legacy and has_local_legacy:
+        print("Found local JSON cache, migrating to parquet...")
+        with open(local_legacy, "r", encoding="utf-8") as f:
+            raw_alerts = json.load(f)
+        print(f"Loaded {len(raw_alerts)} alerts from local JSON cache")
+    elif not has_s3 and has_s3_legacy:
+        print("Migrating S3 data from JSON to parquet...")
+        raw_alerts = s3_read_json(legacy_key)
+        print(f"Loaded {len(raw_alerts)} alerts from S3 JSON")
     elif not has_s3:
-        print("First run — fetching all cities...")
+        print("First run \u2014 fetching all cities...")
         cities = load_cities()
         raw_alerts = asyncio.run(fetch_all_cities(cities))
     else:
         # Incremental: fetch last 24h and merge
-        # Use local file if fresh (< 6 hours old), otherwise fetch from S3
         if has_local and (time.time() - os.path.getmtime(local_raw)) < 6 * 3600:
             print("Using fresh local cache (< 6h old)")
-            with open(local_raw, "r", encoding="utf-8") as f:
-                existing = json.load(f)
+            existing = read_local_parquet(local_raw)
         else:
-            existing = s3_read_json(raw_key)
+            existing = s3_read_parquet(raw_key)
         new_alerts = asyncio.run(fetch_latest())
 
         # Merge & deduplicate by rid
@@ -374,12 +408,11 @@ def run_pipeline():
         raw_alerts = list(by_rid.values())
         print(f"Merged: {len(existing)} existing + {len(new_alerts)} new = {len(raw_alerts)} total")
 
-    # Save raw data locally first, then to S3
-    local_raw = os.path.join(os.path.dirname(__file__), "alerts_all.json")
-    with open(local_raw, "w", encoding="utf-8") as f:
-        json.dump(raw_alerts, f, ensure_ascii=False)
-    print(f"Saved locally: {local_raw} ({os.path.getsize(local_raw) / 1024:.0f} KB)")
-    s3_write_json(raw_key, raw_alerts)
+    # Save raw data locally as parquet, then upload to S3
+    write_local_parquet(local_raw, raw_alerts)
+    size_kb = os.path.getsize(local_raw) / 1024
+    print(f"Saved locally: {local_raw} ({size_kb:.0f} KB)")
+    s3_write_parquet(raw_key, local_raw)
 
     # Transform
     print("Transforming...")
@@ -403,13 +436,7 @@ def run_pipeline():
 
         for key, path in [("optimized/alerts.parquet", alerts_path),
                           ("optimized/events.parquet", events_path)]:
-            size_kb = os.path.getsize(path) / 1024
-            s3.put_object(
-                Bucket=BUCKET, Key=key,
-                Body=open(path, "rb").read(),
-                ContentType="application/octet-stream",
-            )
-            print(f"Uploaded {key} ({size_kb:.0f} KB)")
+            s3_write_parquet(key, path)
 
     # Invalidate CloudFront cache
     cf.create_invalidation(
