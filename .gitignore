@@ -4,3 +4,4 @@ package.zip
 build/
 alerts_all.json
 alerts_all.parquet
+raw_alerts/

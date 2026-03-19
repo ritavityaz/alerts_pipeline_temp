@@ -133,20 +133,8 @@ def s3_write_json(key, data):
     print(f"Uploaded {key} ({len(body) / 1024:.0f} KB)")
 
 
-def read_local_parquet(path):
-    """Read a local Parquet file into a list of dicts."""
-    return pl.read_parquet(path).to_dicts()
-
-
-def write_local_parquet(path, records):
-    """Write a list of dicts to a local Parquet file."""
-    pl.DataFrame(records).write_parquet(path, compression="zstd")
-
-
-def s3_read_parquet(key):
-    """Read a Parquet file from S3 into a list of dicts."""
-    resp = s3.get_object(Bucket=BUCKET, Key=key)
-    return pl.read_parquet(resp["Body"].read()).to_dicts()
+RAW_PREFIX = "raw/alerts/"
+LOCAL_RAW_DIR = os.path.join(os.path.dirname(__file__), "raw_alerts")
 
 
 def s3_write_parquet(key, local_path):
@@ -155,6 +143,89 @@ def s3_write_parquet(key, local_path):
                    ExtraArgs={"ContentType": "application/octet-stream"})
     size_kb = os.path.getsize(local_path) / 1024
     print(f"Uploaded {key} ({size_kb:.0f} KB)")
+
+
+def s3_list_keys(prefix):
+    """List all object keys under a prefix."""
+    keys = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            keys.append(obj["Key"])
+    return sorted(keys)
+
+
+def partition_by_day(alerts):
+    """Group alerts into {date_str: [alerts]} by alertDate."""
+    by_day = {}
+    for a in alerts:
+        date_str = a.get("alertDate", "")[:10]
+        if date_str:
+            by_day.setdefault(date_str, []).append(a)
+    return by_day
+
+
+def load_day_local(date_str):
+    """Load a day's alerts from local cache. Returns [] if not found."""
+    path = os.path.join(LOCAL_RAW_DIR, f"{date_str}.parquet")
+    if os.path.exists(path):
+        return pl.read_parquet(path).to_dicts()
+    return []
+
+
+def load_day_s3(date_str):
+    """Load a day's alerts from S3. Returns [] if not found."""
+    key = f"{RAW_PREFIX}{date_str}.parquet"
+    try:
+        resp = s3.get_object(Bucket=BUCKET, Key=key)
+        return pl.read_parquet(resp["Body"].read()).to_dicts()
+    except Exception:
+        return []
+
+
+def save_day(date_str, alerts):
+    """Save a day's alerts locally and upload to S3."""
+    os.makedirs(LOCAL_RAW_DIR, exist_ok=True)
+    path = os.path.join(LOCAL_RAW_DIR, f"{date_str}.parquet")
+    df = pl.DataFrame(alerts)
+    df.write_parquet(path, compression="zstd")
+    key = f"{RAW_PREFIX}{date_str}.parquet"
+    s3_write_parquet(key, path)
+
+
+def load_all_days():
+    """Load all daily parquet files, preferring local cache, falling back to S3."""
+    os.makedirs(LOCAL_RAW_DIR, exist_ok=True)
+    # Get the union of local and S3 dates
+    local_dates = set()
+    for f in os.listdir(LOCAL_RAW_DIR):
+        if f.endswith(".parquet"):
+            local_dates.add(f.replace(".parquet", ""))
+    s3_dates = set()
+    for key in s3_list_keys(RAW_PREFIX):
+        fname = key.removeprefix(RAW_PREFIX)
+        if fname.endswith(".parquet"):
+            s3_dates.add(fname.replace(".parquet", ""))
+    all_dates = sorted(local_dates | s3_dates)
+    all_alerts = []
+    for date_str in all_dates:
+        if date_str in local_dates:
+            all_alerts.extend(load_day_local(date_str))
+        else:
+            day_alerts = load_day_s3(date_str)
+            if day_alerts:
+                # Cache locally for next time
+                save_day_local(date_str, day_alerts)
+                all_alerts.extend(day_alerts)
+    print(f"Loaded {len(all_alerts)} alerts across {len(all_dates)} days")
+    return all_alerts
+
+
+def save_day_local(date_str, alerts):
+    """Save a day's alerts locally only (no S3 upload)."""
+    os.makedirs(LOCAL_RAW_DIR, exist_ok=True)
+    path = os.path.join(LOCAL_RAW_DIR, f"{date_str}.parquet")
+    pl.DataFrame(alerts).write_parquet(path, compression="zstd")
 
 
 # ── Transform ──────────────────────────────────────────────────
@@ -365,54 +436,48 @@ def generate_snapshot_json(alerts_pq):
 def run_pipeline():
     print(f"[{datetime.now()}] Starting pipeline...")
 
-    # Check if raw data exists (initialization vs incremental)
-    raw_key = "raw/alerts_all.parquet"
+    # Check if daily partitioned data exists
+    has_daily = bool(s3_list_keys(RAW_PREFIX))
     legacy_key = "raw/alerts_all.json"
-    local_raw = os.path.join(os.path.dirname(__file__), "alerts_all.parquet")
     local_legacy = os.path.join(os.path.dirname(__file__), "alerts_all.json")
-    has_s3 = s3_exists(raw_key)
-    has_s3_legacy = not has_s3 and s3_exists(legacy_key)
-    has_local = os.path.exists(local_raw)
-    has_local_legacy = not has_local and os.path.exists(local_legacy)
 
-    if not has_s3 and not has_s3_legacy and has_local:
-        print("Found local parquet cache, uploading to S3...")
-        raw_alerts = read_local_parquet(local_raw)
-        print(f"Loaded {len(raw_alerts)} alerts from local cache")
-    elif not has_s3 and not has_s3_legacy and has_local_legacy:
-        print("Found local JSON cache, migrating to parquet...")
+    if not has_daily and os.path.exists(local_legacy):
+        # Migrate from local JSON cache
+        print("Migrating local JSON cache to daily parquet files...")
         with open(local_legacy, "r", encoding="utf-8") as f:
             raw_alerts = json.load(f)
-        print(f"Loaded {len(raw_alerts)} alerts from local JSON cache")
-    elif not has_s3 and has_s3_legacy:
-        print("Migrating S3 data from JSON to parquet...")
+        print(f"Loaded {len(raw_alerts)} alerts, partitioning by day...")
+        for date_str, day_alerts in partition_by_day(raw_alerts).items():
+            save_day(date_str, day_alerts)
+    elif not has_daily and s3_exists(legacy_key):
+        # Migrate from S3 JSON
+        print("Migrating S3 JSON to daily parquet files...")
         raw_alerts = s3_read_json(legacy_key)
-        print(f"Loaded {len(raw_alerts)} alerts from S3 JSON")
-    elif not has_s3:
+        print(f"Loaded {len(raw_alerts)} alerts, partitioning by day...")
+        for date_str, day_alerts in partition_by_day(raw_alerts).items():
+            save_day(date_str, day_alerts)
+    elif not has_daily:
+        # First run
         print("First run \u2014 fetching all cities...")
         cities = load_cities()
         raw_alerts = asyncio.run(fetch_all_cities(cities))
+        for date_str, day_alerts in partition_by_day(raw_alerts).items():
+            save_day(date_str, day_alerts)
     else:
-        # Incremental: fetch last 24h and merge
-        if has_local and (time.time() - os.path.getmtime(local_raw)) < 6 * 3600:
-            print("Using fresh local cache (< 6h old)")
-            existing = read_local_parquet(local_raw)
-        else:
-            existing = s3_read_parquet(raw_key)
+        # Incremental: fetch last 24h and merge into affected days
         new_alerts = asyncio.run(fetch_latest())
+        new_by_day = partition_by_day(new_alerts)
+        for date_str, new_day in new_by_day.items():
+            existing = load_day_local(date_str) or load_day_s3(date_str)
+            by_rid = {a["rid"]: a for a in existing}
+            for a in new_day:
+                by_rid[a["rid"]] = a
+            merged = list(by_rid.values())
+            print(f"  {date_str}: {len(existing)} existing + {len(new_day)} fetched = {len(merged)} total")
+            save_day(date_str, merged)
 
-        # Merge & deduplicate by rid
-        by_rid = {a["rid"]: a for a in existing}
-        for a in new_alerts:
-            by_rid[a["rid"]] = a
-        raw_alerts = list(by_rid.values())
-        print(f"Merged: {len(existing)} existing + {len(new_alerts)} new = {len(raw_alerts)} total")
-
-    # Save raw data locally as parquet, then upload to S3
-    write_local_parquet(local_raw, raw_alerts)
-    size_kb = os.path.getsize(local_raw) / 1024
-    print(f"Saved locally: {local_raw} ({size_kb:.0f} KB)")
-    s3_write_parquet(raw_key, local_raw)
+    # Load full dataset for transform
+    raw_alerts = load_all_days()
 
     # Transform
     print("Transforming...")
