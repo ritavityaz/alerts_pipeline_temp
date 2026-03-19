@@ -453,12 +453,18 @@ def run_pipeline():
         print(f"  Loaded {len(legacy_alerts)} alerts from local JSON")
     elif s3_exists("raw/alerts_all.parquet"):
         print("Found S3 legacy parquet, merging into daily files...")
-        resp = s3.get_object(Bucket=BUCKET, Key="raw/alerts_all.parquet")
-        legacy_alerts = pl.read_parquet(resp["Body"].read()).to_dicts()
+        tmp_path = os.path.join(tempfile.gettempdir(), "legacy_all.parquet")
+        s3.download_file(BUCKET, "raw/alerts_all.parquet", tmp_path)
+        legacy_alerts = pl.read_parquet(tmp_path).to_dicts()
+        os.unlink(tmp_path)
         print(f"  Loaded {len(legacy_alerts)} alerts from S3 parquet")
     elif s3_exists("raw/alerts_all.json"):
         print("Found S3 legacy JSON, merging into daily files...")
-        legacy_alerts = s3_read_json("raw/alerts_all.json")
+        tmp_path = os.path.join(tempfile.gettempdir(), "legacy_all.json")
+        s3.download_file(BUCKET, "raw/alerts_all.json", tmp_path)
+        with open(tmp_path, "r", encoding="utf-8") as f:
+            legacy_alerts = json.load(f)
+        os.unlink(tmp_path)
         print(f"  Loaded {len(legacy_alerts)} alerts from S3 JSON")
 
     if legacy_alerts:
