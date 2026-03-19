@@ -436,28 +436,49 @@ def generate_snapshot_json(alerts_pq):
 def run_pipeline():
     print(f"[{datetime.now()}] Starting pipeline...")
 
-    # Check if daily partitioned data exists
-    has_daily = bool(s3_list_keys(RAW_PREFIX))
-    legacy_key = "raw/alerts_all.json"
-    local_legacy = os.path.join(os.path.dirname(__file__), "alerts_all.json")
+    # Merge any legacy monolithic files into daily partitions.
+    # Legacy files are never deleted — only read and merged.
+    legacy_alerts = []
+    local_legacy_parquet = os.path.join(os.path.dirname(__file__), "alerts_all.parquet")
+    local_legacy_json = os.path.join(os.path.dirname(__file__), "alerts_all.json")
 
-    if not has_daily and os.path.exists(local_legacy):
-        # Migrate from local JSON cache
-        print("Migrating local JSON cache to daily parquet files...")
-        with open(local_legacy, "r", encoding="utf-8") as f:
-            raw_alerts = json.load(f)
-        print(f"Loaded {len(raw_alerts)} alerts, partitioning by day...")
-        for date_str, day_alerts in partition_by_day(raw_alerts).items():
-            save_day(date_str, day_alerts)
-    elif not has_daily and s3_exists(legacy_key):
-        # Migrate from S3 JSON
-        print("Migrating S3 JSON to daily parquet files...")
-        raw_alerts = s3_read_json(legacy_key)
-        print(f"Loaded {len(raw_alerts)} alerts, partitioning by day...")
-        for date_str, day_alerts in partition_by_day(raw_alerts).items():
-            save_day(date_str, day_alerts)
-    elif not has_daily:
-        # First run
+    if os.path.exists(local_legacy_parquet):
+        print("Found local legacy parquet, merging into daily files...")
+        legacy_alerts = pl.read_parquet(local_legacy_parquet).to_dicts()
+        print(f"  Loaded {len(legacy_alerts)} alerts from local parquet")
+    elif os.path.exists(local_legacy_json):
+        print("Found local legacy JSON, merging into daily files...")
+        with open(local_legacy_json, "r", encoding="utf-8") as f:
+            legacy_alerts = json.load(f)
+        print(f"  Loaded {len(legacy_alerts)} alerts from local JSON")
+    elif s3_exists("raw/alerts_all.parquet"):
+        print("Found S3 legacy parquet, merging into daily files...")
+        resp = s3.get_object(Bucket=BUCKET, Key="raw/alerts_all.parquet")
+        legacy_alerts = pl.read_parquet(resp["Body"].read()).to_dicts()
+        print(f"  Loaded {len(legacy_alerts)} alerts from S3 parquet")
+    elif s3_exists("raw/alerts_all.json"):
+        print("Found S3 legacy JSON, merging into daily files...")
+        legacy_alerts = s3_read_json("raw/alerts_all.json")
+        print(f"  Loaded {len(legacy_alerts)} alerts from S3 JSON")
+
+    if legacy_alerts:
+        for date_str, day_alerts in partition_by_day(legacy_alerts).items():
+            existing = load_day_local(date_str) or load_day_s3(date_str)
+            by_rid = {a["rid"]: a for a in existing}
+            new_count = 0
+            for a in day_alerts:
+                if a["rid"] not in by_rid:
+                    by_rid[a["rid"]] = a
+                    new_count += 1
+            if new_count > 0:
+                save_day(date_str, list(by_rid.values()))
+                print(f"  {date_str}: added {new_count} alerts from legacy data")
+
+    # Check if we have any data at all
+    has_daily = bool(s3_list_keys(RAW_PREFIX))
+
+    if not has_daily:
+        # First run — no legacy files and no daily files
         print("First run \u2014 fetching all cities...")
         cities = load_cities()
         raw_alerts = asyncio.run(fetch_all_cities(cities))
