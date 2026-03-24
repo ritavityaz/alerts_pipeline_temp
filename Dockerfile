@@ -5,6 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY pipeline.py cities.csv ./
+COPY config.py fetch.py storage.py transform.py generate.py orchestrator.py \
+     __init__.py __main__.py cities.csv pipeline/
 
-CMD ["python", "-u", "pipeline.py"]
+CMD ["python", "-u", "-m", "pipeline"]
