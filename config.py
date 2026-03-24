@@ -21,7 +21,11 @@ LOCAL_RAW_ALERTS_DIR = os.path.join(os.path.dirname(__file__), "raw_alerts")
 
 
 def get_current_date():
-    """Get current date from a public time API (avoids relying on server clock)."""
-    resp = urllib.request.urlopen("https://worldtimeapi.org/api/timezone/Asia/Jerusalem", timeout=10)
-    data = json.loads(resp.read())
-    return date.fromisoformat(data["datetime"][:10])
+    """Get current date from a public time API, falling back to server clock."""
+    try:
+        resp = urllib.request.urlopen("https://worldtimeapi.org/api/timezone/Asia/Jerusalem", timeout=10)
+        data = json.loads(resp.read())
+        return date.fromisoformat(data["datetime"][:10])
+    except Exception:
+        print("Warning: time API unavailable, falling back to server clock")
+        return date.today()
