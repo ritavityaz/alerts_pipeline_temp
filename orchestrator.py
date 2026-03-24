@@ -1,25 +1,27 @@
 import asyncio
-import json
 import os
+import signal
 import tempfile
+import time
 from datetime import datetime, timezone
-
-import polars as pl
 
 from .config import (
     S3_BUCKET,
     CLOUDFRONT_DISTRIBUTION_ID,
+    PIPELINE_RUN_INTERVAL_SECONDS,
     S3_RAW_ALERTS_PREFIX,
     s3_client,
     cf_client,
+    get_current_date,
 )
 from .fetch import fetch_all_cities, fetch_latest, load_cities, load_geo_maps
 from .storage import (
+    latest_s3_date,
     load_all_days,
     load_day_local,
     load_day_s3,
+    merge_by_rid,
     partition_by_day,
-    s3_exists,
     s3_list_keys,
     s3_write_json,
     s3_write_parquet,
@@ -33,85 +35,36 @@ from .generate import (
 )
 
 
-def run_pipeline():
-    print(f"[{datetime.now()}] Starting pipeline...")
+def fetch_alerts():
+    """Fetch alerts — full fetch on first run or data gap, incremental otherwise."""
+    s3_keys = s3_list_keys(S3_RAW_ALERTS_PREFIX)
 
-    # Merge any legacy monolithic files into daily partitions.
-    # Legacy files are never deleted — only read and merged.
-    legacy_alerts = []
-    local_legacy_parquet = os.path.join(os.path.dirname(__file__), "alerts_all.parquet")
-    local_legacy_json = os.path.join(os.path.dirname(__file__), "alerts_all.json")
-
-    if os.path.exists(local_legacy_parquet):
-        print("Found local legacy parquet, merging into daily files...")
-        legacy_alerts = pl.read_parquet(local_legacy_parquet).to_dicts()
-        print(f"  Loaded {len(legacy_alerts)} alerts from local parquet")
-    elif os.path.exists(local_legacy_json):
-        print("Found local legacy JSON, merging into daily files...")
-        with open(local_legacy_json, "r", encoding="utf-8") as f:
-            legacy_alerts = json.load(f)
-        print(f"  Loaded {len(legacy_alerts)} alerts from local JSON")
-    elif s3_exists("raw/alerts_all.parquet"):
-        print("Found S3 legacy parquet, merging into daily files...")
-        tmp_path = os.path.join(tempfile.gettempdir(), "legacy_all.parquet")
-        s3_client.download_file(S3_BUCKET, "raw/alerts_all.parquet", tmp_path)
-        legacy_alerts = pl.read_parquet(tmp_path).to_dicts()
-        os.unlink(tmp_path)
-        print(f"  Loaded {len(legacy_alerts)} alerts from S3 parquet")
-    elif s3_exists("raw/alerts_all.json"):
-        print("Found S3 legacy JSON, merging into daily files...")
-        tmp_path = os.path.join(tempfile.gettempdir(), "legacy_all.json")
-        s3_client.download_file(S3_BUCKET, "raw/alerts_all.json", tmp_path)
-        with open(tmp_path, "r", encoding="utf-8") as f:
-            legacy_alerts = json.load(f)
-        os.unlink(tmp_path)
-        print(f"  Loaded {len(legacy_alerts)} alerts from S3 JSON")
-
-    if legacy_alerts:
-        for date_str, day_alerts in partition_by_day(legacy_alerts).items():
-            existing = load_day_local(date_str) or load_day_s3(date_str)
-            by_rid = {a["rid"]: a for a in existing}
-            new_count = 0
-            for a in day_alerts:
-                if a["rid"] not in by_rid:
-                    by_rid[a["rid"]] = a
-                    new_count += 1
-            if new_count > 0:
-                save_day(date_str, list(by_rid.values()))
-                print(f"  {date_str}: added {new_count} alerts from legacy data")
-
-    # Check if we have any data at all
-    has_daily = bool(s3_list_keys(S3_RAW_ALERTS_PREFIX))
-
-    if not has_daily:
-        # First run — no legacy files and no daily files
+    if not s3_keys:
         print("First run — fetching all cities...")
-        cities = load_cities()
-        raw_alerts = asyncio.run(fetch_all_cities(cities))
+        cities = load_cities()# get array of all city names
+        raw_alerts = asyncio.run(fetch_all_cities(cities)) #fetch up to 3k events per city
         for date_str, day_alerts in partition_by_day(raw_alerts).items():
-            save_day(date_str, day_alerts)
+            save_day(date_str, day_alerts)# save locally and to S3
+        return
+
+    gap_days = (get_current_date() - latest_s3_date(s3_keys)).days
+    if gap_days > 1:
+        print(f"Data gap detected ({gap_days} days) — fetching all cities...")
+        cities = load_cities() # get array of all city names
+        raw_alerts = asyncio.run(fetch_all_cities(cities))
     else:
-        # Incremental: fetch last 24h and merge into affected days
-        new_alerts = asyncio.run(fetch_latest())
-        new_by_day = partition_by_day(new_alerts)
-        for date_str, new_day in new_by_day.items():
-            existing = load_day_local(date_str) or load_day_s3(date_str)
-            by_rid = {a["rid"]: a for a in existing}
-            for a in new_day:
-                by_rid[a["rid"]] = a
-            merged = list(by_rid.values())
-            print(f"  {date_str}: {len(existing)} existing + {len(new_day)} fetched = {len(merged)} total")
-            save_day(date_str, merged)
+        print("Fetching fresh data...")
+        raw_alerts = asyncio.run(fetch_latest()) # fetch past 24h data
 
-    # Load full dataset for transform
-    raw_alerts = load_all_days()
+    for date_str, new_day in partition_by_day(raw_alerts).items():
+        existing = load_day_local(date_str) or load_day_s3(date_str) or [] # get day's file
+        merged, new_count = merge_by_rid(existing, new_day) # merge day's file w/ new data
+        print(f"  {date_str}: {len(existing)} existing + {len(new_day)} fetched = {len(merged)} total ({new_count} new)")
+        save_day(date_str, merged) # save locally and to S3
 
-    # Transform
-    print("Transforming...")
-    df_typed, alerts_matched = transform(raw_alerts)
 
-    # Generate optimized parquet files
-    print("Generating optimized files...")
+def generate_and_upload(df_typed, alerts_matched):
+    """Generate optimized files, upload to S3, and invalidate CloudFront."""
     zone_map, name_en_map = load_geo_maps()
     print(f"  Loaded geo mappings for {len(zone_map)} cities")
     alerts_pq = generate_alerts_parquet(df_typed, zone_map)
@@ -119,7 +72,6 @@ def run_pipeline():
     snapshot = generate_snapshot_json(alerts_pq)
     s3_write_json("optimized/snapshot.json", snapshot)
 
-    # Write parquet to temp files and upload
     with tempfile.TemporaryDirectory() as tmp:
         alerts_path = os.path.join(tmp, "alerts.parquet")
         events_path = os.path.join(tmp, "events.parquet")
@@ -130,7 +82,6 @@ def run_pipeline():
                           ("optimized/events.parquet", events_path)]:
             s3_write_parquet(key, path)
 
-    # Invalidate CloudFront cache
     cf_client.create_invalidation(
         DistributionId=CLOUDFRONT_DISTRIBUTION_ID,
         InvalidationBatch={
@@ -146,6 +97,46 @@ def run_pipeline():
         },
     )
     print("CloudFront invalidation created")
+
+
+def run_pipeline():
+    print(f"[{datetime.now()}] Starting pipeline...")
+    fetch_alerts()
+    raw_alerts = load_all_days()
+    print("Transforming...")
+    df_typed, alerts_matched = transform(raw_alerts)
+    print("Generating optimized files...")
+    generate_and_upload(df_typed, alerts_matched)
     print(f"[{datetime.now()}] Pipeline complete! Processed {len(raw_alerts)} alerts")
 
 
+def main():
+    """Run pipeline on a loop with graceful shutdown."""
+    stop = False
+
+    def handle_signal(signum, frame):
+        nonlocal stop
+        print(f"\nReceived signal {signum}, shutting down...")
+        stop = True
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    print(f"[{datetime.now()}] Pipeline launched")
+
+    while not stop:
+        try:
+            run_pipeline()
+        except Exception as e:
+            print(f"[{datetime.now()}] Pipeline error: {e}")
+
+        if stop:
+            break
+
+        print(f"Sleeping {PIPELINE_RUN_INTERVAL_SECONDS}s until next run...")
+        for _ in range(PIPELINE_RUN_INTERVAL_SECONDS):
+            if stop:
+                break
+            time.sleep(1)
+
+    print("Shutdown complete.")

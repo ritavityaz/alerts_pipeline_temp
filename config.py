@@ -1,5 +1,7 @@
+import json
 import os
-from datetime import datetime
+import urllib.request
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import boto3
@@ -16,3 +18,10 @@ cf_client = boto3.client("cloudfront", region_name=os.environ.get("AWS_REGION", 
 
 S3_RAW_ALERTS_PREFIX = "raw/alerts/"
 LOCAL_RAW_ALERTS_DIR = os.path.join(os.path.dirname(__file__), "raw_alerts")
+
+
+def get_current_date():
+    """Get current date from a public time API (avoids relying on server clock)."""
+    resp = urllib.request.urlopen("https://worldtimeapi.org/api/timezone/Asia/Jerusalem", timeout=10)
+    data = json.loads(resp.read())
+    return date.fromisoformat(data["datetime"][:10])

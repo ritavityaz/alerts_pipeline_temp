@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import date
 
 import polars as pl
 
@@ -44,6 +45,22 @@ def s3_list_keys(prefix):
     return sorted(keys)
 
 
+def latest_s3_date(s3_keys):
+    """Parse the date from the last S3 daily file key."""
+    return date.fromisoformat(s3_keys[-1].removeprefix(S3_RAW_ALERTS_PREFIX).removesuffix(".parquet"))
+
+
+def merge_by_rid(existing, new_alerts):
+    """Merge alerts by rid, returning (merged_list, new_count)."""
+    by_rid = {a["rid"]: a for a in existing}
+    new_count = 0
+    for a in new_alerts:
+        if a["rid"] not in by_rid:
+            by_rid[a["rid"]] = a
+            new_count += 1
+    return list(by_rid.values()), new_count
+
+
 def partition_by_day(alerts):
     """Group alerts into {date_str: [alerts]} by alertDate."""
     by_day = {}
@@ -55,6 +72,7 @@ def partition_by_day(alerts):
 
 
 def load_day_local(date_str):
+    print("Using local day file")
     """Load a day's alerts from local cache. Returns [] if not found."""
     path = os.path.join(LOCAL_RAW_ALERTS_DIR, f"{date_str}.parquet")
     if os.path.exists(path):
@@ -63,6 +81,7 @@ def load_day_local(date_str):
 
 
 def load_day_s3(date_str):
+    print("loading day data from S3")
     """Load a day's alerts from S3. Returns [] if not found."""
     key = f"{S3_RAW_ALERTS_PREFIX}{date_str}.parquet"
     try:
