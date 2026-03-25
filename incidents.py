@@ -19,6 +19,7 @@ def build_incidents(raw_alerts):
       - incident_events: every raw row with group_id + pattern attached
       - incident_summary: one row per incident group with start/end/duration/etc.
     """
+    print(f"  [incidents.py] polars version: {pl.__version__}")
     if not raw_alerts:
         raise ValueError("No alerts to process")
 
