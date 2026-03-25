@@ -76,9 +76,14 @@ def build_incidents(raw_alerts):
                     | pl.col("gap_minutes").is_null()
                 )
                 & ~pl.col("event_type").is_in(ATTACH_TYPES)
-            ).cast(pl.Int32).cum_sum().over("data").alias("group_id")
+            ).cast(pl.Int32).alias("_new_group")
     )
-    print("  [4/7] Group IDs assigned")
+    print("  [4a/7] New-group flag computed")
+
+    incidents = incidents.with_columns(
+        pl.col("_new_group").cum_sum().over("data").alias("group_id")
+    ).drop("_new_group")
+    print("  [4b/7] Group IDs assigned")
 
     # ── Pattern classification ─────────────────────────────
     incidents = incidents.with_columns(
