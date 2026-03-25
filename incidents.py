@@ -25,6 +25,7 @@ def build_incidents(raw_alerts):
 
     df = pl.DataFrame(raw_alerts).unique()
     df = df.with_columns(pl.col("category").cast(pl.Int64))
+    print("  [1/7] DataFrame created")
 
     # ── Row-level labeling ─────────────────────────────────────
 
@@ -56,17 +57,18 @@ def build_incidents(raw_alerts):
         .otherwise(pl.lit(None))
         .alias("threat_type"),
     ).sort("data", "ts")
+    print("  [2/7] Row-level labeling done")
 
     # ── Incident grouping ──────────────────────────────────────
     # New group when gap > threshold or previous was resolved,
     # but ATTACH_TYPES always join preceding group.
 
-    incidents = (
-        df
-        .with_columns(
-            pl.col("ts").diff().over("data").dt.total_minutes().alias("gap_minutes")
-        )
-        .with_columns(
+    incidents = df.with_columns(
+        pl.col("ts").diff().over("data").dt.total_minutes().alias("gap_minutes")
+    )
+    print("  [3/7] Gap minutes computed")
+
+    incidents = incidents.with_columns(
             (
                 (
                     pl.col("event_type").shift(1).over("data").is_in(RESOLVED_TYPES)
@@ -75,15 +77,19 @@ def build_incidents(raw_alerts):
                 )
                 & ~pl.col("event_type").is_in(ATTACH_TYPES)
             ).cast(pl.Int32).cum_sum().over("data").alias("group_id")
-        )
-        # ── Pattern classification ─────────────────────────────
-        .with_columns(
+    )
+    print("  [4/7] Group IDs assigned")
+
+    # ── Pattern classification ─────────────────────────────
+    incidents = incidents.with_columns(
             pl.col("event_type").is_in(WARNING_TYPES).any().over("data", "group_id").alias("has_warning"),
             pl.col("event_type").is_in(EVENT_TYPES).any().over("data", "group_id").alias("has_alert"),
             pl.col("event_type").is_in(RESOLVED_TYPES).any().over("data", "group_id").alias("has_resolution"),
             (pl.col("event_type").last().over("data", "group_id") == "weak_resolved").alias("ends_weakResolution"),
-        )
-        .with_columns(
+    )
+    print("  [5/7] Pattern flags computed")
+
+    incidents = incidents.with_columns(
             pl.when(pl.col("has_warning") & pl.col("has_alert") & pl.col("has_resolution"))
                 .then(pl.lit("warning_alert_resolution"))
             .when(pl.col("has_alert") & pl.col("has_resolution"))
@@ -106,9 +112,9 @@ def build_incidents(raw_alerts):
                 .then(pl.lit("X_X_resolution"))
             .otherwise(pl.lit("unclassified"))
             .alias("pattern")
-        )
-        .drop("gap_minutes", "has_warning", "has_alert", "has_resolution", "ends_weakResolution")
     )
+    incidents = incidents.drop("gap_minutes", "has_warning", "has_alert", "has_resolution", "ends_weakResolution")
+    print("  [6/7] Pattern classification done")
 
     # ── Output: incident_events ────────────────────────────────
     incident_events = incidents.select(
@@ -126,11 +132,13 @@ def build_incidents(raw_alerts):
             (pl.col("ts").max() - pl.col("ts").min())
                 .dt.total_minutes().alias("duration_min"),
             pl.len().alias("n_events"),
-            pl.col("threat_type").drop_nulls().unique().list.sort().alias("threat_types"),
+            pl.col("threat_type").drop_nulls().unique().alias("threat_types"),
             pl.col("pattern").first(),
         )
         .sort("data", "group_id")
+        .with_columns(pl.col("threat_types").list.sort())
     )
+    print("  [7/7] Incident summary built")
 
     alerts_count = incident_events.filter(pl.col("event_type") == "alert").height
     print(f"  Incidents: {incident_summary.height} groups from {incident_events.height} events ({alerts_count} alerts)")
