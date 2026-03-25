@@ -28,9 +28,12 @@ from .storage import (
     save_day,
 )
 from .transform import transform
+from .incidents import build_incidents
 from .generate import (
     generate_alerts_parquet,
     generate_events_parquet,
+    generate_incident_events_parquet,
+    generate_incidents_parquet,
     generate_snapshot_json,
 )
 
@@ -63,33 +66,43 @@ def fetch_alerts():
         save_day(date_str, merged) # save locally and to S3
 
 
-def generate_and_upload(df_typed, alerts_matched):
+def generate_and_upload(df_typed, alerts_matched, incident_events, incident_summary):
     """Generate optimized files, upload to S3, and invalidate CloudFront."""
     zone_map, name_en_map = load_geo_maps()
     print(f"  Loaded geo mappings for {len(zone_map)} cities")
+
+    # Legacy tables (preserved for continuity)
     alerts_pq = generate_alerts_parquet(df_typed, zone_map)
     events_pq = generate_events_parquet(alerts_matched, zone_map, name_en_map)
     snapshot = generate_snapshot_json(alerts_pq)
     s3_write_json("optimized/snapshot.json", snapshot)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        alerts_path = os.path.join(tmp, "alerts.parquet")
-        events_path = os.path.join(tmp, "events.parquet")
-        alerts_pq.write_parquet(alerts_path, compression="zstd")
-        events_pq.write_parquet(events_path, compression="zstd")
+    # New incident-based tables
+    incident_events_pq = generate_incident_events_parquet(incident_events)
+    incidents_pq = generate_incidents_parquet(incident_summary, zone_map, name_en_map)
 
-        for key, path in [("optimized/alerts.parquet", alerts_path),
-                          ("optimized/events.parquet", events_path)]:
+    with tempfile.TemporaryDirectory() as tmp:
+        files = {
+            "optimized/alerts.parquet": alerts_pq,
+            "optimized/events.parquet": events_pq,
+            "optimized/incident_events.parquet": incident_events_pq,
+            "optimized/incidents.parquet": incidents_pq,
+        }
+        for key, df in files.items():
+            path = os.path.join(tmp, os.path.basename(key))
+            df.write_parquet(path, compression="zstd")
             s3_write_parquet(key, path)
 
     cf_client.create_invalidation(
         DistributionId=CLOUDFRONT_DISTRIBUTION_ID,
         InvalidationBatch={
             "Paths": {
-                "Quantity": 3,
+                "Quantity": 5,
                 "Items": [
                     "/optimized/alerts.parquet",
                     "/optimized/events.parquet",
+                    "/optimized/incident_events.parquet",
+                    "/optimized/incidents.parquet",
                     "/optimized/snapshot.json",
                 ],
             },
@@ -103,10 +116,15 @@ def run_pipeline():
     print(f"[{datetime.now()}] Starting pipeline...")
     fetch_alerts()
     raw_alerts = load_all_days()
-    print("Transforming...")
+
+    print("Transforming (legacy)...")
     df_typed, alerts_matched = transform(raw_alerts)
+
+    print("Building incidents...")
+    incident_events, incident_summary = build_incidents(raw_alerts)
+
     print("Generating optimized files...")
-    generate_and_upload(df_typed, alerts_matched)
+    generate_and_upload(df_typed, alerts_matched, incident_events, incident_summary)
     print(f"[{datetime.now()}] Pipeline complete! Processed {len(raw_alerts)} alerts")
 
 

@@ -64,6 +64,66 @@ def generate_events_parquet(alerts_matched, zone_map, name_en_map):
     return events
 
 
+def generate_incident_events_parquet(incident_events):
+    """Generate incident_events.parquet — every raw event with incident metadata.
+
+    Stores proper UTC epoch ms (no fake-local hack).
+    """
+    result = (
+        incident_events
+        .filter(pl.col("ts") >= pl.lit(ALERTS_START_DATE))
+        .with_columns(
+            pl.col("ts").dt.epoch("ms").alias("ts"),
+        )
+        .select(
+            "data", "ts", "category", "category_desc",
+            "rid", "event_type", "threat_type", "group_id", "pattern",
+        )
+    )
+    print(f"  Incident events parquet: {result.height} rows, {result['data'].n_unique()} cities")
+    return result
+
+
+def generate_incidents_parquet(incident_summary, zone_map, name_en_map):
+    """Generate incidents.parquet — one row per incident × threat_type.
+
+    Stores proper UTC epoch ms (no fake-local hack).
+    end_ms is always populated (incidents are always finished).
+    Explodes threat_types list so each threat_type gets its own row.
+    """
+    # Only incidents that contain an actual alert
+    filtered = incident_summary.filter(
+        pl.col("pattern").str.contains("_alert_"),
+        pl.col("start") >= pl.lit(ALERTS_START_DATE),
+    )
+
+    events = (
+        filtered
+        .explode("threat_types")
+        .rename({"threat_types": "threat_type"})
+        # Re-attach the full list for each exploded row
+        .join(
+            filtered.select("data", "group_id", "threat_types"),
+            on=["data", "group_id"],
+            how="left",
+        )
+        .with_columns(
+            pl.col("start").dt.epoch("ms").alias("start_ms"),
+            pl.col("end").dt.epoch("ms").alias("end_ms"),
+            pl.col("data").replace(zone_map, default="").alias("zone_en"),
+            pl.col("data").replace(name_en_map, default="").alias("name_en"),
+        )
+        .select(
+            "data", "threat_type", "threat_types",
+            "start_ms", "end_ms", "duration_min", "n_events",
+            "pattern", "group_id", "zone_en", "name_en",
+        )
+    )
+
+    print(f"  Incidents parquet: {events.height} rows ({filtered.height} incidents), {events['data'].n_unique()} cities")
+    return events
+
+
 def generate_snapshot_json(alerts_pq):
     """Generate snapshot.json — precomputed initial dashboard state for instant render."""
     city_agg = alerts_pq.group_by("data").agg(pl.col("count").sum().alias("cnt"))
