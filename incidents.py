@@ -125,7 +125,7 @@ def build_incidents(raw_alerts):
             (pl.col("ts").max() - pl.col("ts").min())
                 .dt.total_minutes().alias("duration_min"),
             pl.len().alias("n_events"),
-            pl.col("threat_type").unique().drop_nulls().sort().alias("threat_types"),
+            pl.col("threat_type").drop_nulls().unique().list.sort().alias("threat_types"),
             pl.col("pattern").first(),
         )
         .sort("data", "group_id")
