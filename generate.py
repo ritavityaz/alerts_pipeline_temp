@@ -91,9 +91,7 @@ def generate_incidents_parquet(incident_summary, zone_map, name_en_map):
     end_ms is always populated (incidents are always finished).
     Explodes threat_types list so each threat_type gets its own row.
     """
-    # Only incidents that contain an actual alert
     filtered = incident_summary.filter(
-        pl.col("pattern").str.contains("_alert_"),
         pl.col("start") >= pl.lit(ALERTS_START_DATE),
     )
 
