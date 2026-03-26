@@ -97,6 +97,12 @@ def generate_incidents_parquet(incident_summary, zone_map, name_en_map):
 
     events = (
         filtered
+        .with_columns(
+            pl.when(pl.col("threat_types").list.len() == 0)
+            .then(pl.lit(["false_alarm"]))
+            .otherwise(pl.col("threat_types"))
+            .alias("threat_types"),
+        )
         .explode("threat_types")
         .rename({"threat_types": "threat_type"})
         # Re-attach the full list for each exploded row
