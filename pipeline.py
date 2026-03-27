@@ -362,8 +362,7 @@ def generate_events_parquet(alerts_matched, zone_map, name_en_map):
     )
 
     # Compute start = min(warning_ts, ts), end = resolved_ts
-    # Store as Israel wall-clock epoch ms (strip tz before epoch)
-    # so dashboard can use new Date(ms) directly without toLocaleString per row
+    # Store as proper UTC epoch ms
     events = (
         filtered
         .with_columns(
@@ -373,8 +372,8 @@ def generate_events_parquet(alerts_matched, zone_map, name_en_map):
         )
         .filter(pl.col("start_ts") >= pl.lit(CUTOFF))
         .with_columns(
-            pl.col("start_ts").dt.replace_time_zone(None).dt.epoch("ms").alias("start_ms"),
-            pl.col("resolved_ts").dt.replace_time_zone(None).dt.epoch("ms").alias("end_ms"),
+            pl.col("start_ts").dt.epoch("ms").alias("start_ms"),
+            pl.col("resolved_ts").dt.epoch("ms").alias("end_ms"),
             pl.col("data").replace(zone_map, default="").alias("zone_en"),
             pl.col("data").replace(name_en_map, default="").alias("name_en"),
         )
@@ -395,11 +394,18 @@ def generate_snapshot_json(alerts_pq):
 
     daily = (
         alerts_pq
-        .with_columns((pl.col("ts") // 86400000).alias("day_key"))
+        .with_columns(
+            pl.from_epoch(pl.col("ts"), time_unit="ms")
+            .dt.replace_time_zone("UTC")
+            .dt.convert_time_zone("Asia/Jerusalem")
+            .dt.date()
+            .alias("day_key")
+        )
         .group_by("day_key").agg(pl.col("count").sum().alias("cnt"))
         .sort("cnt", descending=True)
     )
-    peak_day_ms = int(daily[0, "day_key"] * 86400000)
+    peak_date = daily[0, "day_key"]
+    peak_day_ms = int(datetime(peak_date.year, peak_date.month, peak_date.day, tzinfo=timezone.utc).timestamp() * 1000)
     peak_count = int(daily[0, "cnt"])
 
     cat_agg = alerts_pq.group_by("category").agg(pl.col("count").sum().alias("cnt"))
