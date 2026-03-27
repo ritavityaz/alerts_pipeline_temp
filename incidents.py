@@ -7,6 +7,7 @@ STAY_NEARBY = "ניתן לצאת מהמרחב המוגן אך יש להישאר 
 THRESHOLD_MINUTES = 30
 RESOLVED_TYPES = ["resolved"]
 ATTACH_TYPES = ["resolved", "weak_resolved"]  # always join preceding group
+ATTACH_THRESHOLD_MINUTES = 180  # max gap for ATTACH_TYPES to join preceding group
 WARNING_TYPES = ["early_warning", "weak_resolved"]
 EVENT_TYPES = ["alert"]
 
@@ -70,12 +71,15 @@ def build_incidents(raw_alerts):
 
     incidents = incidents.with_columns(
             (
-                (
-                    pl.col("event_type").shift(1).over("data").is_in(RESOLVED_TYPES)
-                    | (pl.col("gap_minutes") > THRESHOLD_MINUTES)
-                    | pl.col("gap_minutes").is_null()
+                (pl.col("gap_minutes") > ATTACH_THRESHOLD_MINUTES)
+                | (
+                    (
+                        pl.col("event_type").shift(1).over("data").is_in(RESOLVED_TYPES)
+                        | (pl.col("gap_minutes") > THRESHOLD_MINUTES)
+                        | pl.col("gap_minutes").is_null()
+                    )
+                    & ~pl.col("event_type").is_in(ATTACH_TYPES)
                 )
-                & ~pl.col("event_type").is_in(ATTACH_TYPES)
             ).cast(pl.Int32).alias("_new_group")
     )
     print("  [4a/7] New-group flag computed")
